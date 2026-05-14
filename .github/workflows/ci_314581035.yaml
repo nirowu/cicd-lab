@@ -1,17 +1,28 @@
-name: CI
+name: ci
 
 on:
   push:
+    branches:
+      - '**'
+  pull_request:
 
 permissions:
   contents: read
   checks: write
   pull-requests: write
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ci:
-    name: Typecheck, Format, Test
+    name: Quality gate and image build
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['22', '24']
 
     steps:
       - name: Checkout repository
@@ -20,7 +31,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: npm
 
       - name: Install dependencies
@@ -30,7 +41,7 @@ jobs:
         run: npm run typecheck
 
       - name: Prettier check
-        run: npm run format:check
+        run: npx prettier --check "src/**/*.ts" "test/**/*.ts" "*.ts"
 
       - name: Run tests with JUnit report
         id: test
@@ -49,3 +60,40 @@ jobs:
       - name: Fail pipeline if tests failed
         if: ${{ steps.test.outcome == 'failure' }}
         run: exit 1
+
+      - name: Build application
+        run: npm run build
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          BRANCH_NAME="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+
+          if [[ "$BRANCH_NAME" == release/* ]]; then
+            VERSION="${BRANCH_NAME#release/}"
+            IMAGE_TAG="release-${VERSION}"
+          else
+            IMAGE_TAG="sha-${GITHUB_SHA::7}"
+          fi
+
+          echo "branch_name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        if: ${{ matrix.node-version == '24' }}
+        run: docker build -t my-app:${{ steps.meta.outputs.image_tag }} .
+
+      - name: Write CI summary
+        if: always()
+        run: |
+          echo "## CI Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Node.js: ${{ matrix.node-version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Branch: ${{ steps.meta.outputs.branch_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image tag: ${{ steps.meta.outputs.image_tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  cd:
+    name: Deploy release
+    if: ${{ startsWith(github.ref, 'refs/heads/release/') }}
+    needs: ci
+    uses: ./.github/workflows/cd.yaml
